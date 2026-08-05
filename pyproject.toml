@@ -8,14 +8,15 @@ license = "GPL-3.0 license"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.12"
+# scrapy, PyYAML and hrequests are not imported anywhere in this codebase;
+# the <3.12 cap also blocked installing on any current Python. rich was
+# missing even though src_check.py imports it directly.
+python = ">=3.10"
 pystyle = "^2.9"
 yaspin = "^3.4.0"
-scrapy = "^2.14.0"
 tqdm = "^4.67.1"
-PyYAML = "^6.0.3"
-hrequests = {version = "^0.9.2", extras = ["all"]}
 aiohttp = "^3.13.3"
+rich = "^13.9.4"
 
 
 [build-system]

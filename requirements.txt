@@ -1,7 +1,5 @@
 pystyle==2.9
 yaspin==3.4.0
-scrapy==2.14.0
 tqdm==4.67.1
-PyYAML==6.0.3
 aiohttp==3.13.3
-
+rich==13.9.4
