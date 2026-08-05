@@ -9,11 +9,22 @@ from typing import Dict, Iterable, List, Set, Tuple
 import aiohttp
 from tqdm import tqdm
 
-PROXY_PATTERN = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}\b")
+# Each octet is bounded to 0-255 and the port to 1-65535, so junk like
+# 999.999.999.999:99999 is no longer accepted as a valid proxy.
+_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+_PORT = r"(?:6553[0-5]|655[0-2]\d|65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3})"
+PROXY_PATTERN = re.compile(rf"\b{_OCTET}(?:\.{_OCTET}){{3}}:{_PORT}\b")
 
 
-def load_proxy_sources(file_path: str = "proxy_sources.json") -> Dict[str, List[str]]:
-    """Load proxy source URLs grouped by protocol from disk."""
+def load_proxy_sources(file_path: str | None = None) -> Dict[str, List[str]]:
+    """Load proxy source URLs grouped by protocol from disk.
+
+    Defaults to the bundled proxy_sources.json next to this file, not the
+    caller's current working directory -- running proXXy.py from outside the
+    repo used to fail with FileNotFoundError.
+    """
+    if file_path is None:
+        file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_sources.json")
     with open(file_path, "r", encoding="utf-8") as file:
         return json.load(file)
 
@@ -109,42 +120,60 @@ async def _check_proxies_async(
     *,
     test_url: str,
     proxy_scheme: str,
+    label: str,
     concurrency: int = 200,
     timeout: int = 5,
     limit: int | None = None,
 ) -> List[str]:
+    """Test proxies with a fixed pool of workers pulling from a shared index.
+
+    The previous implementation created one asyncio.Task per proxy up front,
+    which meant materialising ~500,000 Task objects at once for a full
+    HTTP.txt run -- enough to exhaust memory on modest machines. A bounded
+    pool keeps memory flat regardless of list size.
+    """
     connector = aiohttp.TCPConnector(limit=0)
     timeout_cfg = aiohttp.ClientTimeout(total=timeout)
-    sem = asyncio.Semaphore(concurrency)
     valid: List[str] = []
+    total = len(proxies)
+    next_index = 0
+    lock = asyncio.Lock()
+    stop = asyncio.Event()
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout_cfg) as session:
-        async def check(proxy: str):
+        async def check(proxy: str) -> bool:
             proxy_url = f"{proxy_scheme}://{proxy}"
-            async with sem:
-                try:
-                    async with session.get(test_url, proxy=proxy_url) as resp:
-                        if 100 <= resp.status < 400:
-                            return proxy
-                except Exception:
-                    return None
-            return None
+            try:
+                async with session.get(test_url, proxy=proxy_url) as resp:
+                    return 100 <= resp.status < 400
+            except Exception:
+                return False
 
-        tasks = [asyncio.create_task(check(p)) for p in proxies]
+        progress = tqdm(total=total, desc=f"Validating {label}", unit="prox", ascii=True)
 
-        for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"Validating {proxy_scheme.upper()}", unit="prox", ascii=True):
-            result = await coro
-            if result:
-                valid.append(result)
+        async def worker():
+            nonlocal next_index
+            while not stop.is_set():
+                async with lock:
+                    if next_index >= total:
+                        return
+                    proxy = proxies[next_index]
+                    next_index += 1
 
-            if limit and len(valid) >= limit:
-                for pending in tasks:
-                    if not pending.done():
-                        pending.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                break
+                ok = await check(proxy)
 
-    return valid
+                async with lock:
+                    if ok:
+                        valid.append(proxy)
+                    progress.update(1)
+                    if limit and len(valid) >= limit:
+                        stop.set()
+
+        workers = [asyncio.create_task(worker()) for _ in range(min(concurrency, total or 1))]
+        await asyncio.gather(*workers, return_exceptions=True)
+        progress.close()
+
+    return valid[:limit] if limit else valid
 
 
 def validate_proxy_file(
@@ -152,14 +181,26 @@ def validate_proxy_file(
     *,
     test_url: str,
     proxy_scheme: str,
+    label: str,
+    output_path: str | None = None,
     concurrency: int = 200,
     timeout: int = 5,
     limit: int | None = None,
 ):
+    """Test proxies from ``file_path`` and write the working ones elsewhere.
+
+    ``output_path`` defaults to a sibling file under ``validated/`` rather
+    than overwriting ``file_path`` in place: the old behaviour meant a small
+    --val-limit permanently discarded the rest of a freshly scraped list,
+    with no way to get it back short of re-scraping.
+    """
     proxies = read_proxy_file(file_path)
     if not proxies:
         print(f"No proxies found in {file_path}")
         return
+
+    if output_path is None:
+        output_path = os.path.join("validated", os.path.basename(file_path))
 
     import time
     start = time.perf_counter()
@@ -168,6 +209,7 @@ def validate_proxy_file(
             proxies,
             test_url=test_url,
             proxy_scheme=proxy_scheme,
+            label=label,
             concurrency=concurrency,
             timeout=timeout,
             limit=limit,
@@ -175,11 +217,10 @@ def validate_proxy_file(
     )
     elapsed = time.perf_counter() - start
 
-    print(f"[*] Valid {proxy_scheme.upper()} proxies: {len(valid):,}")
+    print(f"[*] Valid {label} proxies: {len(valid):,} of {len(proxies):,} tested")
     print(f"[*] Validation time: {elapsed:.2f}s")
 
-    capped = valid if not limit else valid[:limit]
-    write_proxy_file(file_path, dedupe_preserve_order(capped))
+    write_proxy_file(output_path, dedupe_preserve_order(valid))
 
 
 def http_check(file_path: str, *, concurrency: int = 400, timeout: int = 3, limit: int | None = None):
@@ -187,6 +228,7 @@ def http_check(file_path: str, *, concurrency: int = 400, timeout: int = 3, limi
         file_path,
         test_url="http://httpbin.org/ip",
         proxy_scheme="http",
+        label="HTTP",
         concurrency=concurrency,
         timeout=timeout,
         limit=limit,
@@ -194,10 +236,15 @@ def http_check(file_path: str, *, concurrency: int = 400, timeout: int = 3, limi
 
 
 def https_check(file_path: str, *, concurrency: int = 400, timeout: int = 3, limit: int | None = None):
+    # proxy_scheme stays "http": that is the scheme used to *reach* the proxy
+    # itself, independent of the https:// target it is asked to relay. The
+    # previous code reused this value as the printed label too, so a run
+    # against HTTPS.txt announced "Valid HTTP proxies" -- label is now separate.
     validate_proxy_file(
         file_path,
         test_url="https://api.myip.com/",
         proxy_scheme="http",
+        label="HTTPS",
         concurrency=concurrency,
         timeout=timeout,
         limit=limit,

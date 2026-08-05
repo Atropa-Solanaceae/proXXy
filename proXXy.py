@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -53,10 +54,12 @@ def init_logging():
     log_dir = 'output'
     log_file = os.path.join(log_dir, 'error.log')
     os.makedirs(log_dir, exist_ok=True)
-    
+
     try:
         logging.basicConfig(filename=log_file, level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
-        logging.info("Application started.")
+        # error.log is warnings/errors only (see the level above), so a
+        # logging.info() call here could never actually be written -- it was
+        # dead code that misleadingly suggested a startup line gets logged.
     except Exception as e:
         print(f"Failed to initialize logging: {e}")
 
@@ -107,10 +110,18 @@ def check_for_update(script_version):
         return False
 
 
+def _version_tuple(version: str):
+    """'v2.10.1' -> (2, 10, 1), so releases compare numerically, not lexically."""
+    return tuple(int(part) for part in re.findall(r'\d+', version or '')) or (0,)
+
+
 def update_notif(release_info, script_version):
     latest_version = release_info.get('tag_name', script_version)
 
-    if script_version >= latest_version:
+    # A plain string comparison sorted "v2.7" above "v2.10" (since "7" > "1"
+    # lexically), which meant this notice silently stopped firing the moment
+    # the project reached a two-digit minor version.
+    if _version_tuple(latest_version) <= _version_tuple(script_version):
         return False
     print(f"[+] A new version is available: {latest_version}. You are running {script_version}.")
     print("[+] Please update your script to the latest version by using the -u flag.")

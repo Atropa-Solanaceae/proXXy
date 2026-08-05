@@ -1,6 +1,7 @@
 import aiohttp
 import asyncio
 import json
+import os
 from rich.console import Console
 from rich.table import Table
 from tqdm import tqdm
@@ -52,7 +53,11 @@ async def verify_proxy_sources(sources):
     console.print(f"Execution Time: {execution_time_ms:.2f} ms")
 
 def main():
-    with open('proxy_sources.json', 'r') as file:
+    # Resolve relative to this file, not the caller's working directory --
+    # `python /path/to/proXXy.py --src_check` from elsewhere used to raise
+    # FileNotFoundError instead of finding the bundled source list.
+    sources_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'proxy_sources.json')
+    with open(sources_path, 'r') as file:
         proxy_sources = json.load(file)
     asyncio.run(verify_proxy_sources(proxy_sources))
 
